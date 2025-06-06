@@ -63,4 +63,5 @@ This smart contract implements a Decentralized Autonomous Organization (DAO) tha
 - Proposal creators can cancel their proposals before execution
 
 Happy community investing! 🌱
+Thank you
 ```
