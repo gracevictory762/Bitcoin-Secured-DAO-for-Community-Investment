@@ -59,8 +59,11 @@
         )
         (try! (stx-transfer? current-fee tx-sender (as-contract tx-sender)))
         (map-set members tx-sender true)
-        (map-set member-contributions tx-sender u0)
+        (map-set member-contributions tx-sender current-fee)
         (var-set dao-treasury (+ (var-get dao-treasury) current-fee))
+        (var-set total-member-contributions
+            (+ (var-get total-member-contributions) current-fee)
+        )
         (ok true)
     )
 )
@@ -74,6 +77,9 @@
             (+ (default-to u0 (map-get? member-contributions tx-sender)) amount)
         )
         (var-set dao-treasury (+ (var-get dao-treasury) amount))
+        (var-set total-member-contributions
+            (+ (var-get total-member-contributions) amount)
+        )
         (ok true)
     )
 )
@@ -855,4 +861,125 @@
 
 (define-read-only (requires-multisig (amount uint))
     (>= amount (var-get multisig-threshold))
+)
+
+(define-constant err-not-exit-eligible (err u124))
+(define-constant err-exit-cooldown-active (err u125))
+(define-constant err-no-exit-request (err u126))
+(define-constant err-treasury-calculation-failed (err u127))
+
+(define-data-var exit-cooldown-period uint u1008)
+(define-data-var total-member-contributions uint u0)
+
+(define-map exit-requests
+    principal
+    {
+        requested-at: uint,
+        withdrawal-amount: uint,
+        processed: bool,
+    }
+)
+
+(define-public (request-exit)
+    (let (
+            (member-contribution (default-to u0 (map-get? member-contributions tx-sender)))
+            (treasury-balance (var-get dao-treasury))
+            (total-contributions (var-get total-member-contributions))
+            (proportional-share (if (> total-contributions u0)
+                (/ (* member-contribution treasury-balance) total-contributions)
+                u0
+            ))
+        )
+        (asserts! (is-member tx-sender) err-not-member)
+        (asserts! (> member-contribution u0) err-not-exit-eligible)
+        (asserts! (is-none (map-get? exit-requests tx-sender))
+            err-exit-cooldown-active
+        )
+        (map-set exit-requests tx-sender {
+            requested-at: burn-block-height,
+            withdrawal-amount: proportional-share,
+            processed: false,
+        })
+        (ok proportional-share)
+    )
+)
+
+(define-public (execute-exit)
+    (let (
+            (exit-request (unwrap! (map-get? exit-requests tx-sender) err-no-exit-request))
+            (cooldown-end (+ (get requested-at exit-request) (var-get exit-cooldown-period)))
+        )
+        (asserts! (is-member tx-sender) err-not-member)
+        (asserts! (not (get processed exit-request)) err-no-exit-request)
+        (asserts! (>= burn-block-height cooldown-end) err-exit-cooldown-active)
+        (asserts!
+            (<= (get withdrawal-amount exit-request) (var-get dao-treasury))
+            err-insufficient-funds
+        )
+        (try! (as-contract (stx-transfer? (get withdrawal-amount exit-request) tx-sender tx-sender)))
+        (var-set dao-treasury
+            (- (var-get dao-treasury) (get withdrawal-amount exit-request))
+        )
+        (var-set total-member-contributions
+            (- (var-get total-member-contributions)
+                (default-to u0 (map-get? member-contributions tx-sender))
+            ))
+        (map-delete members tx-sender)
+        (map-delete member-contributions tx-sender)
+        (map-delete member-reputation tx-sender)
+        (map-set exit-requests tx-sender (merge exit-request { processed: true }))
+        (ok true)
+    )
+)
+
+(define-public (cancel-exit-request)
+    (begin
+        (asserts! (is-member tx-sender) err-not-member)
+        (asserts! (is-some (map-get? exit-requests tx-sender))
+            err-no-exit-request
+        )
+        (map-delete exit-requests tx-sender)
+        (ok true)
+    )
+)
+
+(define-public (update-exit-cooldown (new-period uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set exit-cooldown-period new-period)
+        (ok true)
+    )
+)
+
+(define-read-only (get-exit-request (member principal))
+    (map-get? exit-requests member)
+)
+
+(define-read-only (calculate-withdrawal-amount (member principal))
+    (let (
+            (member-contribution (default-to u0 (map-get? member-contributions member)))
+            (treasury-balance (var-get dao-treasury))
+            (total-contributions (var-get total-member-contributions))
+        )
+        (if (> total-contributions u0)
+            (ok (/ (* member-contribution treasury-balance) total-contributions))
+            (ok u0)
+        )
+    )
+)
+
+(define-read-only (get-exit-cooldown-period)
+    (var-get exit-cooldown-period)
+)
+
+(define-read-only (can-exit-now (member principal))
+    (match (map-get? exit-requests member)
+        exit-request (and
+            (not (get processed exit-request))
+            (>= burn-block-height
+                (+ (get requested-at exit-request) (var-get exit-cooldown-period))
+            )
+        )
+        false
+    )
 )
