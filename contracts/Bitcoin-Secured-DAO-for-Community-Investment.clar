@@ -16,6 +16,7 @@
 (define-data-var proposal-count uint u0)
 (define-data-var voting-period uint u144) ;; ~1 day in blocks
 (define-data-var execution-threshold uint u51) ;; 51% majority
+(define-data-var total-member-contributions uint u0)
 
 (define-map members
     principal
@@ -145,7 +146,7 @@
             (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
             (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
             (yes-percentage (if (> total-votes u0)
-                (* (get yes-votes proposal) u100)
+                (/ (* (get yes-votes proposal) u100) total-votes)
                 u0
             ))
         )
@@ -406,7 +407,7 @@
             (category (unwrap! (map-get? categories category-id) err-category-not-found))
             (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
             (yes-percentage (if (> total-votes u0)
-                (* (get yes-votes proposal) u100)
+                (/ (* (get yes-votes proposal) u100) total-votes)
                 u0
             ))
         )
@@ -794,7 +795,7 @@
             (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
             (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
             (yes-percentage (if (> total-votes u0)
-                (* (get yes-votes proposal) u100)
+                (/ (* (get yes-votes proposal) u100) total-votes)
                 u0
             ))
         )
@@ -866,10 +867,23 @@
 (define-constant err-not-exit-eligible (err u124))
 (define-constant err-exit-cooldown-active (err u125))
 (define-constant err-no-exit-request (err u126))
-(define-constant err-treasury-calculation-failed (err u127))
+(define-constant err-not-emergency-authorized (err u127))
+(define-constant err-emergency-threshold-not-met (err u128))
+(define-constant err-treasury-calculation-failed (err u129))
 
 (define-data-var exit-cooldown-period uint u1008)
-(define-data-var total-member-contributions uint u0)
+(define-data-var emergency-voting-period uint u24)
+(define-data-var emergency-threshold uint u75)
+
+(define-map emergency-authorized
+    principal
+    bool
+)
+
+(define-map emergency-proposals
+    uint
+    bool
+)
 
 (define-map exit-requests
     principal
@@ -982,4 +996,125 @@
         )
         false
     )
+)
+
+(define-public (authorize-emergency-member (member principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-member member) err-not-member)
+        (map-set emergency-authorized member true)
+        (ok true)
+    )
+)
+
+(define-public (revoke-emergency-authorization (member principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-delete emergency-authorized member)
+        (ok true)
+    )
+)
+
+(define-public (create-emergency-proposal
+        (title (string-ascii 100))
+        (description (string-ascii 500))
+        (amount uint)
+        (recipient principal)
+    )
+    (let ((proposal-id (+ (var-get proposal-count) u1)))
+        (asserts! (is-member tx-sender) err-not-member)
+        (asserts! (default-to false (map-get? emergency-authorized tx-sender))
+            err-not-emergency-authorized
+        )
+        (asserts! (> amount u0) err-invalid-amount)
+        (asserts! (<= amount (var-get dao-treasury)) err-insufficient-funds)
+        (map-set proposals proposal-id {
+            creator: tx-sender,
+            title: title,
+            description: description,
+            amount: amount,
+            recipient: recipient,
+            status: "active",
+            yes-votes: u0,
+            no-votes: u0,
+            created-at: burn-block-height,
+            expires-at: (+ burn-block-height (var-get emergency-voting-period)),
+        })
+        (map-set emergency-proposals proposal-id true)
+        (var-set proposal-count proposal-id)
+        (ok proposal-id)
+    )
+)
+
+(define-public (execute-emergency-proposal (proposal-id uint))
+    (let (
+            (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+            (is-emergency (default-to false (map-get? emergency-proposals proposal-id)))
+            (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+            (yes-percentage (if (> total-votes u0)
+                (/ (* (get yes-votes proposal) u100) total-votes)
+                u0
+            ))
+            (required-threshold (if is-emergency
+                (var-get emergency-threshold)
+                (var-get execution-threshold)
+            ))
+        )
+        (asserts! (is-member tx-sender) err-not-member)
+        (asserts! (is-eq (get status proposal) "active") err-proposal-not-active)
+        (asserts! (>= burn-block-height (get expires-at proposal))
+            err-proposal-in-progress
+        )
+        (if (>= yes-percentage required-threshold)
+            (begin
+                (try! (as-contract (stx-transfer? (get amount proposal) tx-sender
+                    (get recipient proposal)
+                )))
+                (var-set dao-treasury
+                    (- (var-get dao-treasury) (get amount proposal))
+                )
+                (map-set proposals proposal-id
+                    (merge proposal { status: "executed" })
+                )
+                (ok true)
+            )
+            (begin
+                (map-set proposals proposal-id
+                    (merge proposal { status: "rejected" })
+                )
+                (ok false)
+            )
+        )
+    )
+)
+
+(define-public (update-emergency-parameters
+        (new-voting-period uint)
+        (new-threshold uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= new-threshold u100) err-invalid-amount)
+        (asserts! (>= new-threshold (var-get execution-threshold))
+            err-emergency-threshold-not-met
+        )
+        (var-set emergency-voting-period new-voting-period)
+        (var-set emergency-threshold new-threshold)
+        (ok true)
+    )
+)
+
+(define-read-only (is-emergency-authorized (member principal))
+    (default-to false (map-get? emergency-authorized member))
+)
+
+(define-read-only (is-emergency-proposal (proposal-id uint))
+    (default-to false (map-get? emergency-proposals proposal-id))
+)
+
+(define-read-only (get-emergency-parameters)
+    {
+        voting-period: (var-get emergency-voting-period),
+        threshold: (var-get emergency-threshold),
+    }
 )
