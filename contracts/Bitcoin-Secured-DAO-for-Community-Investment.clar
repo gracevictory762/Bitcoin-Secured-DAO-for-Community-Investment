@@ -11,12 +11,14 @@
 (define-constant err-proposal-in-progress (err u109))
 (define-constant err-not-proposal-creator (err u110))
 (define-constant err-invalid-timeframe (err u111))
+(define-constant err-quorum-not-met (err u112))
 
 (define-data-var dao-treasury uint u0)
-(define-data-var membership-fee uint u1000000) ;; 1 STX
+(define-data-var membership-fee uint u1000000)
 (define-data-var proposal-count uint u0)
-(define-data-var voting-period uint u144) ;; ~1 day in blocks
-(define-data-var execution-threshold uint u51) ;; 51% majority
+(define-data-var voting-period uint u144)
+(define-data-var execution-threshold uint u51)
+(define-data-var quorum-percentage uint u20)
 
 (define-map members
     principal
@@ -130,7 +132,9 @@
                 proposals-created: u0,
                 last-vote-block: u0,
                 participation-score: u0,
-            } (map-get? member-voting-stats tx-sender)))
+            }
+                (map-get? member-voting-stats tx-sender)
+            ))
         )
         (asserts! (is-member tx-sender) err-not-member)
         (asserts! (> amount u0) err-invalid-amount)
@@ -148,10 +152,8 @@
             expires-at: (+ burn-block-height (var-get voting-period)),
         })
         ;; Update creator's proposal creation stats
-        (map-set member-voting-stats tx-sender 
-            (merge current-stats { 
-                proposals-created: (+ (get proposals-created current-stats) u1)
-            })
+        (map-set member-voting-stats tx-sender
+            (merge current-stats { proposals-created: (+ (get proposals-created current-stats) u1) })
         )
         ;; Initialize proposal participation tracking
         (map-set proposal-participation proposal-id {
@@ -182,8 +184,12 @@
                 proposals-created: u0,
                 last-vote-block: u0,
                 participation-score: u0,
-            } (map-get? member-voting-stats tx-sender)))
-            (current-participation (unwrap! (map-get? proposal-participation proposal-id) err-proposal-not-found))
+            }
+                (map-get? member-voting-stats tx-sender)
+            ))
+            (current-participation (unwrap! (map-get? proposal-participation proposal-id)
+                err-proposal-not-found
+            ))
         )
         (asserts! (is-member tx-sender) err-not-member)
         (asserts! (is-eq (get status proposal) "active") err-proposal-not-active)
@@ -192,7 +198,7 @@
         )
         (asserts! (is-none (map-get? votes vote-key)) err-already-voted)
         (map-set votes vote-key vote)
-        
+
         ;; Update proposal vote counts and member stats
         (if vote
             (begin
@@ -222,17 +228,19 @@
                 )
             )
         )
-        
+
         ;; Update proposal participation statistics
         (let ((new-voter-count (+ (get actual-voters current-participation) u1)))
             (map-set proposal-participation proposal-id
                 (merge current-participation {
                     actual-voters: new-voter-count,
-                    participation-rate: (/ (* new-voter-count u100) (get total-eligible-voters current-participation)),
+                    participation-rate: (/ (* new-voter-count u100)
+                        (get total-eligible-voters current-participation)
+                    ),
                 })
             )
         )
-        
+
         (var-set total-dao-votes (+ (var-get total-dao-votes) u1))
         (ok true)
     )
@@ -241,6 +249,7 @@
     (let (
             (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
             (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+            (eligible-voters (var-get total-active-members))
             (yes-percentage (if (> total-votes u0)
                 (* (get yes-votes proposal) u100)
                 u0
@@ -251,6 +260,7 @@
         (asserts! (>= burn-block-height (get expires-at proposal))
             err-proposal-in-progress
         )
+        (asserts! (meets-quorum total-votes eligible-voters) err-quorum-not-met)
         (if (>= yes-percentage (var-get execution-threshold))
             (begin
                 (try! (as-contract (stx-transfer? (get amount proposal) tx-sender
@@ -309,6 +319,15 @@
     )
 )
 
+(define-public (set-quorum-percentage (new-quorum uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= new-quorum u100) err-invalid-amount)
+        (var-set quorum-percentage new-quorum)
+        (ok true)
+    )
+)
+
 ;; Read-only functions
 
 (define-read-only (get-proposal (proposal-id uint))
@@ -341,6 +360,17 @@
     (default-to false (map-get? members address))
 )
 
+(define-read-only (get-quorum-percentage)
+    (var-get quorum-percentage)
+)
+
+(define-private (meets-quorum
+        (voted uint)
+        (eligible uint)
+    )
+    (>= (* voted u100) (* eligible (var-get quorum-percentage)))
+)
+
 ;; Voting History Tracker Read-Only Functions
 
 (define-read-only (get-member-voting-stats (member principal))
@@ -359,22 +389,24 @@
         average-participation: (if (> (var-get proposal-count) u0)
             (/ (var-get total-dao-votes) (var-get proposal-count))
             u0
-        )
+        ),
     }
 )
 
 (define-read-only (get-member-participation-rate (member principal))
     (let (
-        (stats (default-to {
-            total-votes-cast: u0,
-            yes-votes: u0,
-            no-votes: u0,
-            proposals-created: u0,
-            last-vote-block: u0,
-            participation-score: u0,
-        } (map-get? member-voting-stats member)))
-        (total-proposals (var-get proposal-count))
-    )
+            (stats (default-to {
+                total-votes-cast: u0,
+                yes-votes: u0,
+                no-votes: u0,
+                proposals-created: u0,
+                last-vote-block: u0,
+                participation-score: u0,
+            }
+                (map-get? member-voting-stats member)
+            ))
+            (total-proposals (var-get proposal-count))
+        )
         (if (and (> total-proposals u0) (is-member member))
             (/ (* (get total-votes-cast stats) u100) total-proposals)
             u0
@@ -388,17 +420,20 @@
     {
         total-active-members: (var-get total-active-members),
         total-proposals-created: (var-get proposal-count),
-        evaluation-note: "Use get-member-voting-stats for individual member details"
+        evaluation-note: "Use get-member-voting-stats for individual member details",
     }
 )
 
-(define-read-only (get-proposal-stats-range (start-id uint) (end-id uint))
+(define-read-only (get-proposal-stats-range
+        (start-id uint)
+        (end-id uint)
+    )
     (if (and (<= start-id end-id) (<= end-id (var-get proposal-count)))
         (ok {
             range-start: start-id,
             range-end: end-id,
             total-proposals-in-range: (+ (- end-id start-id) u1),
-            note: "Use get-proposal-participation for individual proposal details"
+            note: "Use get-proposal-participation for individual proposal details",
         })
         err-invalid-timeframe
     )
@@ -406,35 +441,36 @@
 
 (define-read-only (calculate-member-engagement-score (member principal))
     (let (
-        (stats (default-to {
-            total-votes-cast: u0,
-            yes-votes: u0,
-            no-votes: u0,
-            proposals-created: u0,
-            last-vote-block: u0,
-            participation-score: u0,
-        } (map-get? member-voting-stats member)))
-        (member-contribution (get-member-contribution member))
-        (total-proposals (var-get proposal-count))
-    )
+            (stats (default-to {
+                total-votes-cast: u0,
+                yes-votes: u0,
+                no-votes: u0,
+                proposals-created: u0,
+                last-vote-block: u0,
+                participation-score: u0,
+            }
+                (map-get? member-voting-stats member)
+            ))
+            (member-contribution (get-member-contribution member))
+            (total-proposals (var-get proposal-count))
+        )
         (if (is-member member)
             {
                 voting-participation: (get participation-score stats),
                 proposal-creation-bonus: (* (get proposals-created stats) u5),
                 financial-contribution: (/ member-contribution u1000000), ;; STX in whole units
-                total-engagement: (+ 
-                    (get participation-score stats)
+                total-engagement: (+ (get participation-score stats)
                     (* (get proposals-created stats) u5)
                     (/ member-contribution u1000000)
                 ),
-                last-activity-block: (get last-vote-block stats)
+                last-activity-block: (get last-vote-block stats),
             }
             {
                 voting-participation: u0,
                 proposal-creation-bonus: u0,
                 financial-contribution: u0,
                 total-engagement: u0,
-                last-activity-block: u0
+                last-activity-block: u0,
             }
         )
     )
